@@ -549,7 +549,8 @@ void _spi_interrupt_handler(
 	uint16_t interrupt_status = spi_hw->INTFLAG.reg;
 	interrupt_status &= spi_hw->INTENSET.reg;
 
-	/* Data register empty interrupt */
+#ifndef   GBE_MOD_SPI_INTERRUPT
+	/* Data register empty interrupt - BEFORE Receive complete interrupt */
 	if (interrupt_status & SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY) {
 #  if CONF_SPI_MASTER_ENABLE == true
 		if ((module->mode == SPI_MODE_MASTER) &&
@@ -589,30 +590,65 @@ void _spi_interrupt_handler(
 			}
 		}
 	}
+#endif /* GBE_MOD_SPI_INTERRUPT */
 
 	/* Receive complete interrupt*/
 	if (interrupt_status & SPI_INTERRUPT_FLAG_RX_COMPLETE) {
 		/* Check for overflow */
 		if (spi_hw->STATUS.reg & SERCOM_SPI_STATUS_BUFOVF) {
-			if (module->dir != SPI_DIRECTION_WRITE) {
-				/* Store the error code */
-				module->status = STATUS_ERR_OVERFLOW;
+#ifdef    GBE_MOD_SPI_INTERRUPT
+#  if CONF_SPI_MASTER_ENABLE == true
+            /* Delay processing buffer overflow until both Transmit and Receive buffers empty */
+		    if (module->mode == SPI_MODE_MASTER) {
+			    /* Flush */
+			    uint16_t flush = spi_hw->DATA.reg;
+			    UNUSED(flush);
+                
+    			if (module->dir != SPI_DIRECTION_IDLE) {
+                    if (spi_hw->INTENSET.reg & SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY) {
+                        /* Stop writing any more data */
+				        spi_hw->INTENCLR.reg = SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY;
+                    }
+                    if (spi_hw->INTENSET.reg & ~SPI_INTERRUPT_FLAG_TX_COMPLETE) {
+				        /* Wait for current transmit to finish */
+				        spi_hw->INTENSET.reg = SPI_INTERRUPT_FLAG_TX_COMPLETE;
+                    }
+                }
+                /* Don't process any more pending interrupts */
+                return;
+            }
+#  endif
+#endif /* GBE_MOD_SPI_INTERRUPT */
+		    if (0
+#ifdef    GBE_MOD_SPI_INTERRUPT
+#  if CONF_SPI_SLAVE_ENABLE == true
+            || module->mode == SPI_MODE_SLAVE
+#  endif
+#else  /* GBE_MOD_SPI_INTERRUPT */
+            || 1
+#endif /* GBE_MOD_SPI_INTERRUPT */
+            ) {
+    			/* This is the original (untested) behaviour */
+			    if (module->dir != SPI_DIRECTION_WRITE) {
+				    /* Store the error code */
+				    module->status = STATUS_ERR_OVERFLOW;
 
-				/* End transaction */
-				module->dir = SPI_DIRECTION_IDLE;
+				    /* End transaction */
+				    module->dir = SPI_DIRECTION_IDLE;
 
-				spi_hw->INTENCLR.reg = SPI_INTERRUPT_FLAG_RX_COMPLETE |
-						SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY;
-				/* Run callback if registered and enabled */
-				if (callback_mask & (1 << SPI_CALLBACK_ERROR)) {
-					(module->callback[SPI_CALLBACK_ERROR])(module);
-				}
-			}
-			/* Flush */
-			uint16_t flush = spi_hw->DATA.reg;
-			UNUSED(flush);
-			/* Clear overflow flag */
-			spi_hw->STATUS.reg = SERCOM_SPI_STATUS_BUFOVF;
+				    spi_hw->INTENCLR.reg = SPI_INTERRUPT_FLAG_RX_COMPLETE |
+						    SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY;
+				    /* Run callback if registered and enabled */
+				    if (callback_mask & (1 << SPI_CALLBACK_ERROR)) {
+					    (module->callback[SPI_CALLBACK_ERROR])(module);
+				    }
+			    }
+			    /* Flush */
+			    uint16_t flush = spi_hw->DATA.reg;
+			    UNUSED(flush);
+			    /* Clear overflow flag */
+			    spi_hw->STATUS.reg = SERCOM_SPI_STATUS_BUFOVF;
+            }
 		} else {
 			if (module->dir == SPI_DIRECTION_WRITE) {
 				/* Flush receive buffer when writing */
@@ -629,7 +665,7 @@ void _spi_interrupt_handler(
 				}
 			} else {
 				/* Read data register */
-				_spi_read(module);
+    			_spi_read(module);
 
 				/* Check if the last character have been received */
 				if (module->remaining_rx_buffer_length == 0) {
@@ -649,6 +685,49 @@ void _spi_interrupt_handler(
 			}
 		}
 	}
+
+#ifdef    GBE_MOD_SPI_INTERRUPT
+	/* Data register empty interrupt - AFTER Receive complete interrupt */
+	if (interrupt_status & SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY) {
+#  if CONF_SPI_MASTER_ENABLE == true
+		if ((module->mode == SPI_MODE_MASTER) &&
+			(module->dir == SPI_DIRECTION_READ)) {
+			/* Send dummy byte when reading in master mode */
+			_spi_write_dummy(module);
+			if (module->remaining_dummy_buffer_length == 0) {
+				/* Disable the Data Register Empty Interrupt */
+				spi_hw->INTENCLR.reg
+						= SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY;
+			}
+		}
+#  endif
+
+		if (0
+#  if CONF_SPI_MASTER_ENABLE == true
+		|| ((module->mode == SPI_MODE_MASTER) &&
+			(module->dir != SPI_DIRECTION_READ))
+#  endif
+#  if CONF_SPI_SLAVE_ENABLE == true
+		|| ((module->mode == SPI_MODE_SLAVE) &&
+			(module->dir != SPI_DIRECTION_READ))
+#  endif
+		) {
+			/* Write next byte from buffer */
+			_spi_write(module);
+			if (module->remaining_tx_buffer_length == 0) {
+				/* Disable the Data Register Empty Interrupt */
+				spi_hw->INTENCLR.reg
+						= SPI_INTERRUPT_FLAG_DATA_REGISTER_EMPTY;
+
+				if (module->dir == SPI_DIRECTION_WRITE &&
+						!(module->receiver_enabled)) {
+					/* Enable the Data Register transmit complete Interrupt */
+					spi_hw->INTENSET.reg = SPI_INTERRUPT_FLAG_TX_COMPLETE;
+				}
+			}
+		}
+	}
+#endif /* GBE_MOD_SPI_INTERRUPT */
 
 	/* Transmit complete */
 	if (interrupt_status & SPI_INTERRUPT_FLAG_TX_COMPLETE) {
@@ -680,20 +759,45 @@ void _spi_interrupt_handler(
 		}
 #  endif
 #  if CONF_SPI_MASTER_ENABLE == true
-		if ((module->mode == SPI_MODE_MASTER) &&
-			(module->dir == SPI_DIRECTION_WRITE) && !(module->receiver_enabled)) {
-		  	/* Clear interrupt flag */
-		 	spi_hw->INTENCLR.reg
-					= SPI_INTERRUPT_FLAG_TX_COMPLETE;
-			/* Buffer sent with receiver disabled */
-			module->dir = SPI_DIRECTION_IDLE;
-			module->status = STATUS_OK;
-			/* Run callback if registered and enabled */
-			if (callback_mask & (1 << SPI_CALLBACK_BUFFER_TRANSMITTED)){
-				(module->callback[SPI_CALLBACK_BUFFER_TRANSMITTED])
-						(module);
-			}
-		}
+        /* Split if statement to support GBE_MOD_SPI_INTERRUPT symbol */
+		if (module->mode == SPI_MODE_MASTER) {
+			if ((module->dir == SPI_DIRECTION_WRITE) && !(module->receiver_enabled)) {
+		  	    /* Clear interrupt flag */
+		 	    spi_hw->INTENCLR.reg
+					    = SPI_INTERRUPT_FLAG_TX_COMPLETE;
+			    /* Buffer sent with receiver disabled */
+			    module->dir = SPI_DIRECTION_IDLE;
+			    module->status = STATUS_OK;
+			    /* Run callback if registered and enabled */
+			    if (callback_mask & (1 << SPI_CALLBACK_BUFFER_TRANSMITTED)){
+				    (module->callback[SPI_CALLBACK_BUFFER_TRANSMITTED])
+						    (module);
+                }                            
+#ifdef    GBE_MOD_SPI_INTERRUPT
+            } else {
+            	/* Process buffer overflow once both Transmit and Receive buffers empty */
+		        if ((spi_hw->STATUS.reg & SERCOM_SPI_STATUS_BUFOVF) &&
+    		        (interrupt_status & ~SPI_INTERRUPT_FLAG_RX_COMPLETE)) {
+        		    /* Store the error code */
+        		    module->status = STATUS_ERR_OVERFLOW;
+
+        		    /* End transaction */
+        		    module->dir = SPI_DIRECTION_IDLE;
+
+        		    spi_hw->INTENCLR.reg = SPI_INTERRUPT_FLAG_RX_COMPLETE |
+                            SPI_INTERRUPT_FLAG_TX_COMPLETE;
+        		
+        		    /* Clear overflow flag */
+        		    spi_hw->STATUS.reg = SERCOM_SPI_STATUS_BUFOVF;
+        		
+        		    /* Run callback if registered and enabled */
+        		    if (callback_mask & (1 << SPI_CALLBACK_ERROR)) {
+            		    (module->callback[SPI_CALLBACK_ERROR])(module);
+        		    }
+		        }
+#endif /* GBE_MOD_SPI_INTERRUPT */
+            }
+        }
 #endif
 	}
 
